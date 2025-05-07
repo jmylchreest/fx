@@ -3,26 +3,39 @@ package jsonx
 import (
 	"strconv"
 
-	jsonpath "github.com/antonmedv/fx/path"
+	"github.com/antonmedv/fx/internal/jsonpath"
+)
+
+type Kind byte
+
+const (
+	Err Kind = iota
+	Null
+	Bool
+	Number
+	String
+	Object
+	Array
 )
 
 type Node struct {
 	Prev, Next, End *Node
-	directParent    *Node
-	indirectParent  *Node
+	Parent          *Node
 	Collapsed       *Node
 	Depth           uint8
-	Key             []byte
-	Value           []byte
+	Kind            Kind
+	Key             string
+	Value           string
 	Size            int
-	Chunk           []byte
+	Chunk           string
 	ChunkEnd        *Node
 	Comma           bool
 	Index           int
+	LineNumber      int
 }
 
-// append ands a node as a child to the current node (body of {...} or [...]).
-func (n *Node) append(child *Node) {
+// Append ands a node as a child to the current node (body of {...} or [...]).
+func (n *Node) Append(child *Node) {
 	if n.End == nil {
 		n.End = n
 	}
@@ -35,14 +48,19 @@ func (n *Node) append(child *Node) {
 	}
 }
 
-// adjacent adds a node as a sibling to the current node ({}{}{} or [][][]).
-func (n *Node) adjacent(child *Node) {
+// Adjacent adds a node as a sibling to the current node ({}{}{} or [][][]).
+func (n *Node) Adjacent(child *Node) {
 	end := n.End
 	if end == nil {
 		end = n
 	}
 	end.Next = child
 	child.Prev = end
+	if n.IsCollapsed() {
+		// Also attach to collapsed node.
+		n.Next = child
+		child.Prev = n
+	}
 }
 
 func (n *Node) insertChunk(chunk *Node) {
@@ -72,7 +90,7 @@ func (n *Node) dropChunks() {
 		return
 	}
 
-	n.Chunk = nil
+	n.Chunk = ""
 
 	n.Next = n.ChunkEnd.Next
 	if n.Next != nil {
@@ -86,19 +104,17 @@ func (n *Node) HasChildren() bool {
 	return n.End != nil
 }
 
-func (n *Node) Parent() *Node {
-	if n.directParent == nil {
-		return nil
+func (n *Node) Root() *Node {
+	parent := n.Parent
+	for parent != nil {
+		n = parent
+		parent = n.Parent
 	}
-	parent := n.directParent
-	if parent.indirectParent != nil {
-		parent = parent.indirectParent
-	}
-	return parent
+	return n
 }
 
 func (n *Node) IsWrap() bool {
-	return n.Value == nil && n.Chunk != nil
+	return n.Value == "" && n.Chunk != ""
 }
 
 func (n *Node) IsCollapsed() bool {
@@ -160,11 +176,27 @@ func (n *Node) ExpandRecursively(level, maxLevel int) {
 	}
 }
 
+func (n *Node) FindByPath(path []any) *Node {
+	it := n
+	for _, part := range path {
+		if it == nil {
+			return nil
+		}
+		switch part := part.(type) {
+		case string:
+			it = it.FindChildByKey(part)
+		case int:
+			it = it.FindChildByIndex(part)
+		}
+	}
+	return it
+}
+
 func (n *Node) FindChildByKey(key string) *Node {
 	it := n.Next
 	for it != nil && it != n.End {
-		if it.Key != nil {
-			k, err := strconv.Unquote(string(it.Key))
+		if it.Key != "" {
+			k, err := strconv.Unquote(it.Key)
 			if err != nil {
 				return nil
 			}
@@ -197,33 +229,12 @@ func (n *Node) FindChildByIndex(index int) *Node {
 	return nil
 }
 
-func (n *Node) paths(prefix string, paths *[]string, nodes *[]*Node) {
-	it := n.Next
-	for it != nil && it != n.End {
-		var path string
-
-		if it.Key != nil {
-			quoted := string(it.Key)
-			unquoted, err := strconv.Unquote(quoted)
-			if err == nil && jsonpath.Identifier.MatchString(unquoted) {
-				path = prefix + "." + unquoted
-			} else {
-				path = prefix + "[" + quoted + "]"
-			}
-		} else if it.Index >= 0 {
-			path = prefix + "[" + strconv.Itoa(it.Index) + "]"
-		}
-
-		*paths = append(*paths, path)
-		*nodes = append(*nodes, it)
-
-		if it.HasChildren() {
-			it.paths(path, paths, nodes)
-			it = it.End.Next
-		} else {
-			it = it.Next
-		}
+func (n *Node) FindNextNonErr() *Node {
+	it := n
+	for it != nil && it.Kind == Err {
+		it = it.Next
 	}
+	return it
 }
 
 func (n *Node) Children() ([]string, []*Node) {
@@ -242,7 +253,7 @@ func (n *Node) Children() ([]string, []*Node) {
 	}
 
 	for it != nil && it != n.End {
-		if it.Key != nil {
+		if it.Key != "" {
 			key := string(it.Key)
 			unquoted, err := strconv.Unquote(key)
 			if err == nil {
@@ -260,4 +271,73 @@ func (n *Node) Children() ([]string, []*Node) {
 	}
 
 	return paths, nodes
+}
+
+func (n *Node) Bottom() *Node {
+	it := n
+	for it.Next != nil {
+		if it.End != nil {
+			it = it.End
+		} else {
+			it = it.Next
+		}
+	}
+	return it
+}
+
+func (n *Node) Paths(paths *[]string, nodes *[]*Node) {
+	joinPath := func(prefix string, n *Node) string {
+		var path string
+		if n.Key != "" {
+			quoted := n.Key
+			unquoted, err := strconv.Unquote(quoted)
+			if err == nil && jsonpath.Identifier.MatchString(unquoted) {
+				path = prefix + "." + unquoted
+			} else {
+				path = prefix + "[" + quoted + "]"
+			}
+		} else if n.Index >= 0 {
+			path = prefix + "[" + strconv.Itoa(n.Index) + "]"
+		}
+		return path
+	}
+
+	type item struct {
+		node *Node
+		path string
+	}
+	var queue []item
+	queue = append(queue, item{node: n, path: ""})
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		it := curr.node
+		prefix := curr.path
+
+		if it.IsCollapsed() {
+			it = it.Collapsed
+		} else {
+			it = it.Next
+		}
+
+		for it != nil && it != curr.node.End {
+			path := joinPath(prefix, it)
+			if path != "" {
+				if len(*paths) == cap(*paths) {
+					return
+				}
+				*paths = append(*paths, path)
+				*nodes = append(*nodes, it)
+			}
+
+			if it.HasChildren() {
+				queue = append(queue, item{node: it, path: path})
+				it = it.End.Next
+			} else {
+				it = it.Next
+			}
+		}
+	}
 }
